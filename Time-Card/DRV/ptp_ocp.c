@@ -429,6 +429,7 @@ struct ptp_ocp {
 	struct system_time_snapshot snapshot;
 	u64			ptm_t1_prev;
 	u64			ptm_t4_prev;
+	bool		has_ptm_support;
 };
 
 #define OCP_REQ_TIMESTAMP	BIT(0)
@@ -448,6 +449,7 @@ struct ocp_driver_data {
 	u8 min_revision;
 	u8 max_revision;
 	struct ocp_resource *ocp_resource;
+	bool ptm_support;
 };
 
 static int ptp_ocp_register_mem(struct ptp_ocp *bp, struct ocp_resource *r);
@@ -1024,14 +1026,16 @@ static struct ocp_resource ocp_fb_resource_rev2[] = {
 
 static struct ocp_driver_data ocp_fb_driver_data[] = {
 	{
-		.min_revision = 1,
+		.min_revision = 0,
 		.max_revision = 1,
 		.ocp_resource = (struct ocp_resource *) (&ocp_fb_resource_rev1),
+		.ptm_support = false,
 	},
 	{
 		.min_revision = 2,
 		.max_revision = 2,
 		.ocp_resource = (struct ocp_resource *) (&ocp_fb_resource_rev2),
+		.ptm_support = true,
 	},
 	{ }
 };
@@ -1222,6 +1226,7 @@ static struct ocp_driver_data ocp_art_driver_data[] = {
 		.min_revision = 0,
 		.max_revision = 255,
 		.ocp_resource = (struct ocp_resource *) (&ocp_art_resource),
+		.ptm_support = false,
 	},
 	{ }
 };
@@ -1559,11 +1564,12 @@ ptp_ocp_syncdevicetime(ktime_t *device_time,
 	/* wait until valid */
 	count = 100;
 	do {
+		count--;
 		if ((ioread32(&reg->status) & PTM_STATUS_BUSY) == 0)
 			break;
-	}while (--count);
+	} while (count > 0);
 
-	if (!count) {
+	if (count <= 0) {
 		printk("Exceeded number of tries for PTM cycle\n");
 		return -ETIMEDOUT;
 	}
@@ -1573,12 +1579,17 @@ ptp_ocp_syncdevicetime(ktime_t *device_time,
 	t1_curr = ((u64)t1_curr_h << 32 | t1_curr_l);
 	t1 = ns_to_ktime(t1_curr);
 
+	printk("Time T1: %llu", t1);
+
 	t2_curr_l = ioread32(&reg->master_time[1]);
 	t2_curr_h = ioread32(&reg->master_time[0]);
 	t2_curr = ((u64)t2_curr_h << 32 | t2_curr_l);
 
+	printk("Time T2: %llu", t2_curr);
+
 	/* t3-t2 from downstream port */
 	prop_delay = ioread32(&reg->link_delay);
+	printk("Time Prop Delay: %u", prop_delay);
 	/* PTM Master Time formula */
 	ptm_master_time = t2_curr - (((bp->ptm_t4_prev - bp->ptm_t1_prev) - prop_delay) >> 1);
 
@@ -1604,6 +1615,9 @@ ptp_ocp_getcrosststamp(struct ptp_clock_info *ptp_info,
         	struct system_device_crosststamp *cts)
 {
 	struct ptp_ocp *bp = container_of(ptp_info, struct ptp_ocp, ptp_info);
+
+	if (!bp->has_ptm_support)
+		return 0;
 
 	return get_device_system_crosststamp(ptp_ocp_syncdevicetime,
                          bp, &bp->snapshot, cts);
@@ -2983,6 +2997,7 @@ ptp_ocp_get_resources(struct ptp_ocp *bp, kernel_ulong_t driver_data, struct ocp
 	for(d = ocp_driver_data; d->ocp_resource; d++) {
 		if (d->min_revision <= rev_id && d->max_revision >= rev_id) {
 			*table = d->ocp_resource;
+			bp->has_ptm_support = d->ptm_support;
 			err = 0;
 		}
 	}
@@ -5170,16 +5185,18 @@ ptp_ocp_enable_ptm(struct ptp_ocp *bp)
 	/* prepare T1 & T4 for next request */
 	count = 100;
 	do {
+		count--;
 		if ((ioread32(&reg->status) & PTM_STATUS_BUSY) == 0)
 			break;
-	} while (--count);
+	} while (count > 0);
 
 	iowrite32(PTM_CONTROL_ENABLE | PTM_CONTROL_TRIGGER, &reg->ctrl);
 	count = 100;
 	do {
+		count--;
 		if ((ioread32(&reg->status) & PTM_STATUS_BUSY) == 0)
 			break;
-	} while (--count);
+	} while (count > 0);
 
 	bp->ptm_t4_prev = (((u64) ioread32(&reg->t4_time[0]) << 32) |
 		(ioread32(&reg->t4_time[1]) & 0xffffffff));
@@ -5339,7 +5356,7 @@ ptp_ocp_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	 * allow this - if not all of the IRQ's are returned, skip the
 	 * extra devices and just register the clock.
 	 */
-	err = pci_alloc_irq_vectors(pdev, 1, 64, PCI_IRQ_MSIX);
+	err = pci_alloc_irq_vectors(pdev, 1, 64, PCI_IRQ_MSI | PCI_IRQ_MSIX);
 	if (err < 0) {
 		dev_err(&pdev->dev, "alloc_irq_vectors err: %d\n", err);
 		goto out;
@@ -5366,7 +5383,11 @@ ptp_ocp_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (err)
 		goto out;
 
+	if (bp->has_ptm_support) {
 	ptp_ocp_enable_ptm(bp);
+	} else {
+		bp->ptp_info.getcrosststamp = NULL;
+	}
 	ptp_ocp_info(bp);
 	ptp_ocp_devlink_register(devlink, &pdev->dev);
 	return 0;
