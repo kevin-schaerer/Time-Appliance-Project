@@ -357,9 +357,10 @@ struct ptp_ocp_serial_port {
 	int baud;
 };
 
-#define OCP_BOARD_ID_LEN		13
-#define OCP_SERIAL_LEN			6
-#define OCP_CONFIG_SIZE			4096
+#define OCP_BOARD_ID_LEN			13
+#define OCP_SERIAL_LEN				6
+#define OCP_CONFIG_SIZE				4096
+#define OCP_SECOND_IN_NANOSECOND 	1000000000
 
 struct ptp_ocp {
 	struct pci_dev		*pdev;
@@ -1524,13 +1525,60 @@ ptp_ocp_adjtime(struct ptp_clock_info *ptp_info, s64 delta_ns)
 	return 0;
 }
 
-static int
-ptp_ocp_null_adjfine(struct ptp_clock_info *ptp_info, long scaled_ppm)
+static void
+__ptp_ocp_adjfine_locked(struct ptp_ocp *bp, long scaled_ppm)
 {
-	if (scaled_ppm == 0)
-		return 0;
+	u32 ctrl, drift_adj;
+	u32 select;
+	s32 delta;
 
-	return -EOPNOTSUPP;
+	// ppbs
+	delta = 1000 * (abs(scaled_ppm) >> 16);
+
+	// if there are fractions
+    if ((abs(scaled_ppm) & 0xFFFF) != 0)
+    {
+        delta += 1000 / (0x10000 / (abs(scaled_ppm) & 0xFFFF)); // fractional ppms rounded to 1ns
+    }
+
+    // recover sign
+    if (scaled_ppm < 0)
+    {
+        delta = -1 * delta;
+    }
+
+	drift_adj = abs(delta);
+
+	if (delta < 0)
+	{
+		drift_adj |= 0x80000000;
+	}
+
+	select = ioread32(&bp->reg->select);
+	iowrite32(OCP_SELECT_CLK_REG, &bp->reg->select);
+
+	iowrite32(OCP_SECOND_IN_NANOSECOND, &bp->reg->drift_window_ns);
+
+	iowrite32(drift_adj, &bp->reg->drift_ns);
+
+	ctrl = OCP_CTRL_ADJUST_DRIFT | OCP_CTRL_ENABLE;
+	iowrite32(ctrl, &bp->reg->ctrl);
+
+	/* restore clock selection */
+	iowrite32(select >> 16, &bp->reg->select);
+}
+
+static int
+ptp_ocp_adjfine(struct ptp_clock_info *ptp_info, long scaled_ppm)
+{
+	struct ptp_ocp *bp = container_of(ptp_info, struct ptp_ocp, ptp_info);
+	unsigned long flags;
+
+	spin_lock_irqsave(&bp->lock, flags);
+	__ptp_ocp_adjfine_locked(bp, scaled_ppm);
+	spin_unlock_irqrestore(&bp->lock, flags);
+	
+	return 0;
 }
 
 static int
@@ -1730,7 +1778,7 @@ static const struct ptp_clock_info ptp_ocp_clock_info = {
 	.gettimex64		= ptp_ocp_gettimex,
 	.settime64		= ptp_ocp_settime,
 	.adjtime		= ptp_ocp_adjtime,
-	.adjfine		= ptp_ocp_null_adjfine,
+	.adjfine		= ptp_ocp_adjfine,
 	.adjphase		= ptp_ocp_null_adjphase,
 	.getcrosststamp = ptp_ocp_getcrosststamp,
 	.enable			= ptp_ocp_enable,
