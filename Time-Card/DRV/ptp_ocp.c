@@ -1613,7 +1613,7 @@ ptp_ocp_syncdevicetime(ktime_t *device_time,
 	count = 100;
 	do {
 		count--;
-		if ((ioread32(&reg->status) & PTM_STATUS_BUSY) == 0)
+		if (((ioread32(&reg->status) & PTM_STATUS_BUSY) == 0) && ((ioread32(&reg->status) & PTM_STATUS_VALID) == 1))
 			break;
 	} while (count > 0);
 
@@ -1627,17 +1627,12 @@ ptp_ocp_syncdevicetime(ktime_t *device_time,
 	t1_curr = ((u64)t1_curr_h << 32 | t1_curr_l);
 	t1 = ns_to_ktime(t1_curr);
 
-	printk("Time T1: %llu", t1);
-
 	t2_curr_l = ioread32(&reg->master_time[1]);
 	t2_curr_h = ioread32(&reg->master_time[0]);
 	t2_curr = ((u64)t2_curr_h << 32 | t2_curr_l);
 
-	printk("Time T2: %llu", t2_curr);
-
 	/* t3-t2 from downstream port */
 	prop_delay = ioread32(&reg->link_delay);
-	printk("Time Prop Delay: %u", prop_delay);
 	/* PTM Master Time formula */
 	ptm_master_time = t2_curr - (((bp->ptm_t4_prev - bp->ptm_t1_prev) - prop_delay) >> 1);
 
@@ -5221,6 +5216,27 @@ ptp_ocp_serial_info(struct device *dev, const char *name, int port, int baud)
 }
 
 static void
+ptp_ocp_disable_ptm(struct ptp_ocp *bp)
+{	
+	struct ptp_ocp_ext_src *ptm = bp->ptm;
+	struct ptm_reg __iomem *reg = ptm->mem;
+	int count;
+
+	/* disable PTM control*/
+	iowrite32(0, &reg->ctrl);
+	count = 100;
+	do {
+		count--;
+		if ((ioread32(&reg->status)) == 0)
+			break;
+	} while (count > 0);
+
+	if (count <= 0) {
+		printk("PTM not disabled: Status = 0x%X \n", reg->status);
+	}
+}
+
+static void
 ptp_ocp_enable_ptm(struct ptp_ocp *bp)
 {	
 	struct ptp_ocp_ext_src *ptm = bp->ptm;
@@ -5228,15 +5244,7 @@ ptp_ocp_enable_ptm(struct ptp_ocp *bp)
 	int count;
 
 	/* enable PTM control and start first request */
-	iowrite32(PTM_CONTROL_ENABLE | PTM_CONTROL_TRIGGER, &reg->ctrl);
-
 	/* prepare T1 & T4 for next request */
-	count = 100;
-	do {
-		count--;
-		if ((ioread32(&reg->status) & PTM_STATUS_BUSY) == 0)
-			break;
-	} while (count > 0);
 
 	iowrite32(PTM_CONTROL_ENABLE | PTM_CONTROL_TRIGGER, &reg->ctrl);
 	count = 100;
@@ -5245,6 +5253,22 @@ ptp_ocp_enable_ptm(struct ptp_ocp *bp)
 		if ((ioread32(&reg->status) & PTM_STATUS_BUSY) == 0)
 			break;
 	} while (count > 0);
+	
+	if (count <= 0) {
+		printk("Enable and trigger 1st PTM failed: Status = 0x%X \n", reg->status);
+	}
+
+	iowrite32(PTM_CONTROL_ENABLE | PTM_CONTROL_TRIGGER, &reg->ctrl);
+	count = 100;
+	do {
+		count--;
+		if ((ioread32(&reg->status) & PTM_STATUS_BUSY) == 0)
+			break;
+	} while (count > 0);
+	
+	if (count <= 0) {
+		printk("Enable and trigger 2nd PTM failed: Status = 0x%X \n", reg->status);
+	}
 
 	bp->ptm_t4_prev = (((u64) ioread32(&reg->t4_time[0]) << 32) |
 		(ioread32(&reg->t4_time[1]) & 0xffffffff));
@@ -5432,7 +5456,8 @@ ptp_ocp_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto out;
 
 	if (bp->has_ptm_support) {
-	ptp_ocp_enable_ptm(bp);
+		ptp_ocp_disable_ptm(bp);
+		ptp_ocp_enable_ptm(bp);
 	} else {
 		bp->ptp_info.getcrosststamp = NULL;
 	}
